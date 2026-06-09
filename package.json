@@ -1,0 +1,12 @@
+{
+  "name": "daily-intelligence-agent",
+  "version": "3.0.0",
+  "type": "module",
+  "description": "Market + Tech daily briefing — 100% free (Groq + Serper)",
+  "scripts": {
+    "market": "node agent.js market",
+    "tech":   "node agent.js tech",
+    "both":   "node agent.js both",
+    "start":  "node agent.js both"
+  }
+}
