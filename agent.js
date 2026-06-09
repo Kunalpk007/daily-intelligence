@@ -11,162 +11,177 @@ import fs   from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 
+// In ES Modules (type:"module"), __dirname doesn't exist.
+// We recreate it by converting the current file's URL to a path.
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Load .env for local development.
+// On GitHub Actions, secrets are already in process.env (injected by the workflow),
+// so this silently does nothing when .env is missing.
+try { process.loadEnvFile(); } catch { /* .env not found — expected on CI */ }
+
+// process.argv holds command-line arguments: [node, script, ...args]
+// argv[2] is the first user-supplied argument, e.g. "node agent.js market" → "market"
 const MODE    = process.argv[2] || "both";
-const TODAY   = new Date().toISOString().split("T")[0];
+const TODAY   = new Date().toISOString().split("T")[0]; // "YYYY-MM-DD"
 const OUT_DIR = path.join(__dirname, "reports");
 if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR);
 
-// ── Verified free-tier limits (June 2026) ───────────────────
-// Groq  llama-3.3-70b-versatile : 30 RPM | 1000 RPD | 100K TPD — no card
-// Serper.dev                     : 2500 total queries  — no card
-// Telegram Bot API               : unlimited           — free
-// GitHub Actions                 : 2000 min/month      — free
+// ── Free-tier limits (verified June 2026) ───────────────────
+// Groq  llama-3.3-70b-versatile : 30 RPM | 1000 RPD | 100K TPD
+// Serper.dev                     : 2500 total queries
+// Telegram Bot API               : unlimited
+// GitHub Actions                 : 2000 min/month
 // ────────────────────────────────────────────────────────────
 
 const GROQ_MODEL = "llama-3.3-70b-versatile";
 const GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions";
-const SERPER_URL = "https://google.serper.dev/news"; // news endpoint for freshness
+const SERPER_URL = "https://google.serper.dev/news"; // /news returns fresher results than /search
 
 // ── Fail-fast env check ──────────────────────────────────────
-// Runs before anything else. Exits with clear message if a key is missing.
+// Called before any network request. Exits immediately with a clear message
+// if a required key is missing — no confusing API errors downstream.
 function checkEnv() {
   const errors = [];
   if (!process.env.GROQ_API_KEY)   errors.push("  GROQ_API_KEY   — get free at console.groq.com (no card)");
   if (!process.env.SERPER_API_KEY) errors.push("  SERPER_API_KEY — get free at serper.dev (no card, 2500 queries)");
   if (errors.length) {
     console.error("\n❌ MISSING API KEYS — agent cannot start.\n");
-    console.error("Add these to your .env file or GitHub Secrets:\n");
+    console.error("Add these to your .env file (local) or GitHub Secrets (CI):\n");
     errors.forEach(e => console.error(e));
     console.error("\nSee SETUP.txt for step-by-step instructions.\n");
     process.exit(1);
   }
 }
 
-// ── Serper.dev search ────────────────────────────────────────
-// Returns structured results or a typed error object.
+// ── Serper.dev web search ────────────────────────────────────
+// Sends a search query and returns formatted results as a plain string,
+// or a typed error object so the agent can mention the failure in the
+// report instead of crashing the whole run.
 async function webSearch(query) {
   try {
     const res = await fetch(SERPER_URL, {
-      method: "POST",
+      method:  "POST",
       headers: {
         "X-API-KEY":    process.env.SERPER_API_KEY,
         "Content-Type": "application/json",
       },
+      // gl:"in" = India region results, hl:"en" = English
       body: JSON.stringify({ q: query, num: 6, gl: "in", hl: "en" }),
     });
 
-    // ── Serper error handling ──────────────────────────────
-    if (res.status === 401) {
-      return { error: "SERPER_INVALID_KEY", message: "Serper API key is invalid or expired. Check SERPER_API_KEY in your .env / GitHub Secrets." };
-    }
-    if (res.status === 403) {
-      return { error: "SERPER_FREE_TIER_EXHAUSTED", message: "Serper free tier (2500 queries) is exhausted. Visit serper.dev to top up ($50 for 50K queries) or create a new account for another 2500 free queries." };
-    }
-    if (res.status === 429) {
-      return { error: "SERPER_RATE_LIMITED", message: "Serper rate limit hit. Wait 60 seconds and retry." };
-    }
-    if (!res.ok) {
-      return { error: "SERPER_HTTP_ERROR", message: `Serper returned HTTP ${res.status}. Check your key and try again.` };
-    }
+    // Map HTTP error codes to human-readable typed errors
+    if (res.status === 401) return { error: "SERPER_INVALID_KEY",         message: "Serper API key is invalid or expired. Check SERPER_API_KEY in your .env / GitHub Secrets." };
+    if (res.status === 403) return { error: "SERPER_FREE_TIER_EXHAUSTED", message: "Serper free tier (2500 queries) exhausted. Visit serper.dev to top up or create a new account." };
+    if (res.status === 429) return { error: "SERPER_RATE_LIMITED",        message: "Serper rate limit hit. Wait 60 seconds and retry." };
+    if (!res.ok)            return { error: "SERPER_HTTP_ERROR",          message: `Serper returned HTTP ${res.status}. Check your key and try again.` };
 
-    const data = await res.json();
-    const items = data.news || data.organic || [];
+    const data  = await res.json();
+    const items = data.news || data.organic || []; // .news from /news endpoint, .organic from /search
     if (items.length === 0) return `No results found for: "${query}"`;
 
+    // Format as bullet points: title, 200-char snippet, source URL
     return items.slice(0, 5)
       .map(r => `• ${r.title}\n  ${(r.snippet || r.description || "").slice(0, 200)}\n  ${r.link || r.url}`)
       .join("\n\n");
 
   } catch (err) {
-    // Network-level failure (DNS, timeout, etc.)
-    return { error: "SERPER_NETWORK_ERROR", message: `Network error reaching Serper: ${err.message}. Check your internet connection.` };
+    // Network-level failure (no internet, DNS failure, timeout)
+    return { error: "SERPER_NETWORK_ERROR", message: `Network error reaching Serper: ${err.message}` };
   }
 }
 
 // ── Groq LLM call ────────────────────────────────────────────
+// Sends the full conversation history to Groq and returns the model's response.
+// Groq uses the same API format as OpenAI (/chat/completions).
 async function callGroq(messages) {
   const res = await fetch(GROQ_URL, {
-    method: "POST",
+    method:  "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+      Authorization:  `Bearer ${process.env.GROQ_API_KEY}`,
     },
     body: JSON.stringify({
-      model: GROQ_MODEL,
+      model:       GROQ_MODEL,
       messages,
-      max_tokens: 3000,
-      temperature: 0.2,
+      max_tokens:  3000,
+      temperature: 0.2, // lower = more factual, less creative/hallucinated
       tools: [{
         type: "function",
         function: {
-          name: "web_search",
+          name:        "web_search",
           description: "Search for current news, prices, and data. Call once per topic.",
-          parameters: {
-            type: "object",
+          parameters:  {
+            type:       "object",
             properties: { query: { type: "string" } },
-            required: ["query"],
+            required:   ["query"],
           },
         },
       }],
     }),
   });
 
-  // ── Groq error handling ──────────────────────────────────
-  if (res.status === 401) {
-    throw new Error("GROQ_INVALID_KEY: Groq API key is invalid. Check GROQ_API_KEY in your .env / GitHub Secrets. Get a free key at console.groq.com.");
-  }
+  if (res.status === 401) throw new Error("GROQ_INVALID_KEY: API key invalid. Check GROQ_API_KEY in your .env / GitHub Secrets.");
+  if (res.status === 503 || res.status === 502) throw new Error("GROQ_SERVICE_DOWN: Groq is temporarily unavailable. Check status.groq.com.");
+
   if (res.status === 429) {
-    const body = await res.json().catch(() => ({}));
+    const body       = await res.json().catch(() => ({}));
     const retryAfter = res.headers.get("retry-after") || "60";
-    if (body?.error?.message?.includes("daily")) {
-      throw new Error(`GROQ_DAILY_LIMIT: Groq free tier daily limit (1000 requests/day) reached. Resets at midnight UTC. Try again tomorrow, or add a card at console.groq.com for 10x limits (still free to upgrade).`);
-    }
-    throw new Error(`GROQ_RATE_LIMITED: Too many requests. Groq free tier allows 30 requests/min. Retry after ${retryAfter}s.`);
+    if (body?.error?.message?.includes("daily"))
+      throw new Error("GROQ_DAILY_LIMIT: Free tier (1000 req/day) reached. Resets at midnight UTC.");
+    throw new Error(`GROQ_RATE_LIMITED: Too many requests. Retry after ${retryAfter}s.`);
   }
-  if (res.status === 503 || res.status === 502) {
-    throw new Error("GROQ_SERVICE_DOWN: Groq API is temporarily unavailable. Check status at status.groq.com and retry in a few minutes.");
-  }
+
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`GROQ_HTTP_${res.status}: ${text.slice(0, 200)}`);
   }
 
-  return await res.json();
+  return res.json();
 }
 
 // ── Agentic loop ─────────────────────────────────────────────
+// This implements the "ReAct" pattern: the LLM decides what to search for,
+// we run the search, feed the results back, and repeat until the model
+// stops calling tools and writes the final report.
+//
+// Iteration flow:
+//   1. Send messages → model responds with tool calls ("search for X")
+//   2. Run all searches in parallel
+//   3. Append results to messages → go back to step 1
+//   4. When model responds with no tool calls → it's writing the final report
 async function runAgent(label, systemPrompt, userPrompt) {
+  // The full conversation: grows each iteration as we add tool results
   const messages = [
     { role: "system", content: systemPrompt },
     { role: "user",   content: userPrompt   },
   ];
 
-  const MAX_ITER = 14;
-  let   iter     = 0;
+  const MAX_ITER    = 14; // safety cap to prevent runaway loops
+  let   iter        = 0;
   let   searchCount = 0;
 
   process.stdout.write(`  [${label}] searching`);
 
   while (iter < MAX_ITER) {
     iter++;
-    const response = await callGroq(messages);
-    const choice   = response.choices?.[0];
+    const response  = await callGroq(messages);
+    const choice    = response.choices?.[0];
     if (!choice) throw new Error("Groq returned empty response.");
 
     const message   = choice.message;
-    const toolCalls = message.tool_calls || [];
+    const toolCalls = message.tool_calls || []; // functions the model wants to call this turn
 
-    messages.push(message);
-    process.stdout.write(".");
+    messages.push(message);     // keep the model's message in history
+    process.stdout.write(".");  // show progress without newlines
 
-    // No tool calls → agent finished, return final text
+    // No tool calls = model is done searching, final report is in message.content
     if (toolCalls.length === 0 || choice.finish_reason === "stop") {
       process.stdout.write(` done (${searchCount} searches, ${iter} LLM calls)\n`);
       return message.content || "";
     }
 
-    // Execute tool calls in parallel
+    // Run all requested searches in parallel (faster than sequential)
     const results = await Promise.all(
       toolCalls.map(async (tc) => {
         let args;
@@ -176,25 +191,27 @@ async function runAgent(label, systemPrompt, userPrompt) {
         const raw = await webSearch(args.query);
         searchCount++;
 
-        // If search returned a typed error object, surface it clearly
+        // If the search errored, surface it in the model's context so it can
+        // mention the gap in the report rather than fabricating data
         if (typeof raw === "object" && raw.error) {
           return {
-            role: "tool",
-            tool_call_id: tc.id,
-            name: "web_search",
-            content: `⚠️ SEARCH ERROR (${raw.error}): ${raw.message}`,
+            role:         "tool",
+            tool_call_id: tc.id,   // must match the id Groq sent — links result to the right call
+            name:         "web_search",
+            content:      `⚠️ SEARCH ERROR (${raw.error}): ${raw.message}`,
           };
         }
 
         return {
-          role: "tool",
+          role:         "tool",
           tool_call_id: tc.id,
-          name: "web_search",
-          content: String(raw),
+          name:         "web_search",
+          content:      String(raw),
         };
       })
     );
 
+    // Spread adds each result as its own message (required by the tool-use protocol)
     messages.push(...results);
   }
 
@@ -338,31 +355,30 @@ Sources:
 ============================`;
 
 // ── Telegram push ─────────────────────────────────────────────
+// Sends the report to your phone via Telegram bot.
+// Silently skipped if TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID are not set.
 async function sendTelegram(text) {
   const token  = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
-  if (!token || !chatId) return; // silently skip if not configured
+  if (!token || !chatId) return;
 
+  // Telegram has a 4096-char message limit — split into chunks
   const chunks = [];
   for (let i = 0; i < text.length; i += 4000) chunks.push(text.slice(i, i + 4000));
 
   for (const chunk of chunks) {
     const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-      method: "POST",
+      method:  "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text: chunk }),
+      body:    JSON.stringify({ chat_id: chatId, text: chunk }),
     });
+
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      // Specific Telegram errors
-      if (err.error_code === 401) {
-        console.error("  ⚠️  Telegram: Invalid bot token. Check TELEGRAM_BOT_TOKEN.");
-      } else if (err.error_code === 400 && err.description?.includes("chat not found")) {
-        console.error("  ⚠️  Telegram: Chat not found. Make sure you pressed START on your bot.");
-      } else {
-        console.error(`  ⚠️  Telegram error ${err.error_code}: ${err.description}`);
-      }
-      return; // don't retry on auth errors
+      if      (err.error_code === 401)                                          console.error("  ⚠️  Telegram: Invalid bot token. Check TELEGRAM_BOT_TOKEN.");
+      else if (err.error_code === 400 && err.description?.includes("chat not found")) console.error("  ⚠️  Telegram: Chat not found. Press START on your bot first.");
+      else                                                                      console.error(`  ⚠️  Telegram error ${err.error_code}: ${err.description}`);
+      return;
     }
   }
   console.log("  📱 Telegram notification sent.");
@@ -370,8 +386,7 @@ async function sendTelegram(text) {
 
 // ── Main ──────────────────────────────────────────────────────
 async function main() {
-  // Fail first — check keys before doing anything
-  checkEnv();
+  checkEnv(); // exit early if any required API key is missing
 
   console.log(`\n🤖 Daily Intelligence Agent v3`);
   console.log(`   Model : Groq / ${GROQ_MODEL} (free tier)`);
@@ -385,26 +400,22 @@ async function main() {
       console.log("📈 Running MARKET agent...");
       results.market = await runAgent("MARKET", MARKET_SYSTEM, MARKET_USER);
     }
-
     if (MODE === "tech" || MODE === "both") {
       console.log("💻 Running TECH agent...");
       results.tech = await runAgent("TECH", TECH_SYSTEM, TECH_USER);
     }
   } catch (err) {
-    // Surface typed errors cleanly — no stack trace noise
+    // Print the typed error (e.g. GROQ_DAILY_LIMIT) cleanly — no stack trace
     console.error(`\n❌ Agent stopped: ${err.message}\n`);
-    // Still try to send partial results if any
     if (!results.market && !results.tech) process.exit(1);
   }
 
   const report = [results.market, results.tech].filter(Boolean).join("\n\n").trim();
-
   if (!report) {
     console.error("❌ No report generated. Check the errors above.");
     process.exit(1);
   }
 
-  // Save report
   const filename = `${TODAY}-${MODE}.txt`;
   fs.writeFileSync(path.join(OUT_DIR, filename), report);
   console.log(`\n✅ Saved → reports/${filename}`);
@@ -412,7 +423,6 @@ async function main() {
   console.log(report);
   console.log("─".repeat(52));
 
-  // Push to Telegram (optional)
   await sendTelegram(report);
 }
 
